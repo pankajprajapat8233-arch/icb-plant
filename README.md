@@ -620,6 +620,17 @@ const ini   = n => n.split(" ").map(p=>p[0]).join("").slice(0,2).toUpperCase();
 const esc   = s => { const d=document.createElement("div"); d.textContent=s; return d.innerHTML; };
 const ft    = ts => new Date(ts).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});
 const fdt   = ts => new Date(ts).toLocaleString("en-IN",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"});
+// Format a duration in milliseconds as "2h 15m" or "45m" or "3d 4h"
+function durStr(ms) {
+  if (ms < 0) ms = 0;
+  const totalMin = Math.round(ms / 60000);
+  const days  = Math.floor(totalMin / 1440);
+  const hours = Math.floor((totalMin % 1440) / 60);
+  const mins  = totalMin % 60;
+  if (days > 0)  return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
 const getU  = id => TEAM.find(u=>u.id===id) || {id, name:"Unknown", color:"avb"};
 const tList = () => Object.values(tickets).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
 const efSt  = t  => (t.status!=="Resolved"&&t.status!=="Closed"&&Date.now()>t.dueAt)?"Overdue":t.status;
@@ -825,10 +836,16 @@ function doLogout() {
 function listenTeam() {
   DB.ref("team").on("value", snap => {
     TEAM = [];
-    snap.forEach(child => TEAM.push({ id: child.key, ...child.val() }));
+    snap.forEach(child => {
+      const val = child.val() || {};
+      TEAM.push({ ...val, id: child.key }); // Firebase key always wins as the id
+    });
     populateDepts();
     populateFilters();
     renderAll();
+  }, err => {
+    console.error("listenTeam error:", err);
+    toast("Sync error", "Could not load team — check Firebase rules", "alert");
   });
 }
 function listenTickets() {
@@ -944,7 +961,20 @@ function resetTF() {
 
 // ── STATUS UPDATE ─────────────────────────────────────────────
 function updateStatus(key,status) {
-  DB.ref("tickets/"+key).update({status});
+  const t = tickets[key]; if (!t) return;
+  const now = Date.now();
+  const fields = { status };
+
+  // Record timestamp for whichever status is being set, only the first time it's reached
+  if (status === "In Progress" && !t.inProgressAt) fields.inProgressAt = now;
+  if (status === "Resolved"    && !t.resolvedAt)   fields.resolvedAt   = now;
+  if (status === "Closed"      && !t.closedAt)     fields.closedAt     = now;
+
+  DB.ref("tickets/"+key).update(fields);
+
+  // Update local copy immediately so detail view reflects it without waiting for listener
+  Object.assign(t, fields);
+
   toast("Status updated",status,status==="Resolved"||status==="Closed"?"success":"");
   closeMo();
 }
@@ -1091,12 +1121,39 @@ function renderReports() {
   const list=tList();
   const today=new Date();today.setHours(0,0,0,0);
   const tl=list.filter(t=>t.createdAt>=today.getTime());
-  const res=list.filter(t=>t.status==="Resolved"||t.status==="Closed");
+
+  // Use REAL closedAt/resolvedAt timestamps — fall back to whichever is set
+  const res=list.filter(t=>t.resolvedAt||t.closedAt);
   let avgMin=0;
-  if(res.length){const tot=res.reduce((s,t)=>{const l=t.updates?.length?new Date("1970/01/01 "+t.updates[t.updates.length-1].time).getTime():t.dueAt;return s+Math.max(0,(l-t.createdAt)/60000);},0);avgMin=Math.round(tot/res.length)||45;}
-  const bd={};list.forEach(t=>{const d=new Date(t.createdAt).toLocaleDateString("en-IN",{day:"2-digit",month:"short"});bd[d]=bd[d]||{r:0,res:0};bd[d].r++;if(t.status==="Resolved"||t.status==="Closed")bd[d].res++;});
+  if(res.length){
+    const tot=res.reduce((s,t)=>{
+      const endTime = t.closedAt || t.resolvedAt;
+      return s + Math.max(0,(endTime - t.createdAt)/60000);
+    },0);
+    avgMin=Math.round(tot/res.length);
+  }
+
+  // Daily summary — compute per-day average close time from real timestamps
+  const bd={};
+  list.forEach(t=>{
+    const d=new Date(t.createdAt).toLocaleDateString("en-IN",{day:"2-digit",month:"short"});
+    bd[d]=bd[d]||{r:0,res:0,totalCloseMin:0,closedCount:0};
+    bd[d].r++;
+    if(t.status==="Resolved"||t.status==="Closed"){
+      bd[d].res++;
+      const endTime = t.closedAt || t.resolvedAt;
+      if (endTime) {
+        bd[d].totalCloseMin += Math.max(0,(endTime - t.createdAt)/60000);
+        bd[d].closedCount++;
+      }
+    }
+  });
   const dt=document.getElementById("daily-tb");
-  if(dt) dt.innerHTML=Object.entries(bd).slice(0,7).map(([d,v])=>`<tr><td>${d}</td><td>${v.r}</td><td>${v.res}</td><td>${avgMin}m</td></tr>`).join("")||`<tr><td colspan="4"><div class="empty"><i class="ti ti-calendar"></i>No data</div></td></tr>`;
+  if(dt) dt.innerHTML=Object.entries(bd).slice(0,7).map(([d,v])=>{
+    const dayAvg = v.closedCount ? Math.round(v.totalCloseMin/v.closedCount) : 0;
+    return `<tr><td>${d}</td><td>${v.r}</td><td>${v.res}</td><td>${dayAvg?durStr(dayAvg*60000):"—"}</td></tr>`;
+  }).join("")||`<tr><td colspan="4"><div class="empty"><i class="ti ti-calendar"></i>No data</div></td></tr>`;
+
   const dptObj={};list.forEach(t=>{dptObj[t.dept]=(dptObj[t.dept]||0)+1;});
   const maxD=Math.max(1,...Object.values(dptObj));
   const dbd=document.getElementById("dept-breakdown");
@@ -1105,6 +1162,10 @@ function renderReports() {
   const rl=document.getElementById("recur-list");
   if(rl){const rc=Object.entries(byT).filter(([,c])=>c>1).sort((a,b)=>b[1]-a[1]).slice(0,5);
     rl.innerHTML=rc.map(([k,c])=>`<div class="rcitem"><span>${esc(k)}...</span><span class="rccnt">${c}×</span></div>`).join("")||`<div class="empty"><i class="ti ti-check"></i>No recurring problems</div>`;}
+
+  // Update the avg-close stat card with real duration format
+  const avgCard = document.querySelector("#rsr .sv.amber");
+  if (avgCard) avgCard.textContent = avgMin ? durStr(avgMin*60000) : "—";
 }
 
 function renderAdmin() {
@@ -1127,6 +1188,23 @@ function renderAdmin() {
 function openDetail(key) {
   const t=tickets[key];if(!t)return;
   const es=efSt(t),ov=es==="Overdue";
+
+  // Build the time tracking rows — only show steps that have actually happened
+  let timeRows = `<div class="drow2"><span class="dlbl"><i class="ti ti-flag" style="font-size:13px;vertical-align:-2px;color:var(--bluel)"></i> Raised</span><span style="font-size:12px">${fdt(t.createdAt)}</span></div>`;
+
+  if (t.inProgressAt) {
+    const dur = durStr(t.inProgressAt - t.createdAt);
+    timeRows += `<div class="drow2"><span class="dlbl"><i class="ti ti-player-play" style="font-size:13px;vertical-align:-2px;color:var(--amber)"></i> In Progress</span><span style="font-size:12px">${fdt(t.inProgressAt)} <span style="color:var(--tx3)">(${dur} after raised)</span></span></div>`;
+  }
+  if (t.resolvedAt) {
+    const fromStart = durStr(t.resolvedAt - t.createdAt);
+    timeRows += `<div class="drow2"><span class="dlbl"><i class="ti ti-check" style="font-size:13px;vertical-align:-2px;color:#82c45d"></i> Resolved</span><span style="font-size:12px">${fdt(t.resolvedAt)} <span style="color:var(--tx3)">(${fromStart} total)</span></span></div>`;
+  }
+  if (t.closedAt) {
+    const fromStart = durStr(t.closedAt - t.createdAt);
+    timeRows += `<div class="drow2"><span class="dlbl"><i class="ti ti-circle-check" style="font-size:13px;vertical-align:-2px;color:var(--tx2)"></i> Closed</span><span style="font-size:12px">${fdt(t.closedAt)} <span style="color:var(--tx3)">(${fromStart} total)</span></span></div>`;
+  }
+
   setMo(`<div class="mh"></div>
     <div style="font-size:11px;color:var(--blue);font-weight:700;margin-bottom:5px">${t.ticketId}</div>
     <div style="font-size:17px;font-weight:700;margin-bottom:9px;line-height:1.3">${esc(t.title)}</div>
@@ -1137,8 +1215,11 @@ function openDetail(key) {
       <div class="drow2"><span class="dlbl">Department</span><span>${t.dept}</span></div>
       <div class="drow2"><span class="dlbl">Raised By</span>${avHtml(t.raisedBy)}</div>
       <div class="drow2"><span class="dlbl">Assigned To</span>${avHtml(t.assignedTo)}</div>
-      <div class="drow2"><span class="dlbl">Raised At</span><span style="font-size:12px">${fdt(t.createdAt)}</span></div>
       <div class="drow2"><span class="dlbl">Due By</span><span style="font-size:12px;${ov?"color:#f3868a;font-weight:700":""}">${fdt(t.dueAt)}${ov?" ⚠":""}</span></div>
+    </div>
+    <div style="margin-top:14px;background:rgba(59,142,232,.06);border:.5px solid rgba(59,142,232,.2);border-radius:var(--rs);padding:11px 13px">
+      <div style="font-size:10px;font-weight:700;color:var(--bluel);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px"><i class="ti ti-clock-hour-4" style="font-size:13px;vertical-align:-2px"></i> Time Tracking</div>
+      ${timeRows}
     </div>
     <div style="margin-top:13px">
       <div style="font-size:10px;font-weight:700;color:var(--tx2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Update Status</div>
@@ -1201,10 +1282,17 @@ async function addUser() {
   }
 
   // Save new member directly to Firebase — they can log in immediately
-  await DB.ref("team/"+uid).set({
+  const newMember = {
     id:uid, phone, pw, name, role, dept,
     isHOD:role==="Admin (HOD)", isDef, color:COLORS[TEAM.length%COLORS.length]
-  });
+  };
+  await DB.ref("team/"+uid).set(newMember);
+
+  // ALSO update local TEAM array immediately — don't wait for listener round-trip
+  TEAM.push(newMember);
+  renderAdmin();
+  renderTeam();
+  populateFilters();
 
   ["aname","aphone","apw"].forEach(id=>document.getElementById(id).value="");
   document.getElementById("arole").value="";
@@ -1272,11 +1360,18 @@ async function saveUser(uid) {
     if (Object.keys(upd).length) await DB.ref().update(upd);
   }
 
-  await DB.ref("team/"+uid).update({
+  const updatedFields = {
     name, phone, role, dept,
     isHOD:role==="Admin (HOD)", isDef,
     ...(newpw?{pw:newpw}:{})
-  });
+  };
+  await DB.ref("team/"+uid).update(updatedFields);
+
+  // Update local TEAM array immediately — don't wait for listener round-trip
+  Object.assign(u, updatedFields);
+  renderAdmin();
+  renderTeam();
+  populateFilters();
 
   // Update local ME if editing ourselves
   if (ME?.id===uid) {
@@ -1294,6 +1389,13 @@ function delUser(uid) {
   const u=TEAM.find(t=>t.id===uid);if(!u)return;
   if (!confirm(`Delete ${u.name}?\nThey will no longer be able to log in.`)) return;
   DB.ref("team/"+uid).remove();
+
+  // Update local TEAM array immediately
+  TEAM = TEAM.filter(t => t.id !== uid);
+  renderAdmin();
+  renderTeam();
+  populateFilters();
+
   toast("Deleted",`${u.name} removed`,"");
 }
 
