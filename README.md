@@ -5,8 +5,38 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#0d0f14">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="ICB Plant">
+<meta name="mobile-web-app-capable" content="yes">
 <title>ICB Plant — Issue Tracker</title>
+<!-- App icon (embedded SVG — no separate icon files needed) -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%233B8EE8'/%3E%3Ctext x='50' y='66' font-size='52' font-family='Arial,sans-serif' font-weight='700' fill='white' text-anchor='middle'%3EI%3C/text%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%233B8EE8'/%3E%3Ctext x='50' y='66' font-size='52' font-family='Arial,sans-serif' font-weight='700' fill='white' text-anchor='middle'%3EI%3C/text%3E%3C/svg%3E">
+<!-- Embedded PWA manifest — makes "Add to Home Screen" install as a real standalone app -->
+<link rel="manifest" id="pwa-manifest">
+<script>
+(function() {
+  const baseUrl = window.location.href.split('#')[0].split('?')[0];
+  const iconSvg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%233B8EE8'/%3E%3Ctext x='50' y='66' font-size='52' font-family='Arial,sans-serif' font-weight='700' fill='white' text-anchor='middle'%3EI%3C/text%3E%3C/svg%3E";
+  const manifest = {
+    name: "ICB Plant — Issue Tracker",
+    short_name: "ICB Plant",
+    description: "Plant issue ticket management system",
+    start_url: baseUrl,
+    scope: baseUrl.replace(/[^/]*$/, ''),
+    display: "standalone",
+    background_color: "#0d0f14",
+    theme_color: "#0d0f14",
+    orientation: "portrait",
+    icons: [
+      { src: iconSvg, sizes: "192x192", type: "image/svg+xml", purpose: "any maskable" },
+      { src: iconSvg, sizes: "512x512", type: "image/svg+xml", purpose: "any maskable" }
+    ]
+  };
+  const blob = new Blob([JSON.stringify(manifest)], {type: 'application/json'});
+  document.getElementById('pwa-manifest').href = URL.createObjectURL(blob);
+})();
+</script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css">
 
 <!-- Firebase SDKs (loaded via CDN, no npm/install needed) -->
@@ -412,6 +442,7 @@ textarea.fc{resize:vertical;min-height:84px}
       <div class="ni hod-only" data-p="admin" onclick="showP('admin',this)"><i class="ti ti-settings"></i><span>Admin / Users</span></div>
     </div>
     <div class="sb-foot">
+      <button class="btn btn-sm btn-ghost" id="install-app-btn" onclick="installApp()" style="display:none;margin-bottom:6px;background:rgba(59,142,232,.12);border-color:rgba(59,142,232,.4);color:#B8D9F7"><i class="ti ti-device-mobile-plus"></i> Install App on Phone</button>
       <button class="btn btn-sm btn-ghost" onclick="reqNotif()"><i class="ti ti-bell"></i> Enable Alerts</button>
       <button class="btn btn-sm btn-ghost" onclick="doLogout()" style="margin-top:6px"><i class="ti ti-logout"></i> Logout</button>
     </div>
@@ -641,14 +672,55 @@ function avHtml(id){const u=getU(id);return `<div class="avrow"><div class="av $
 
 // ── STARTUP ──────────────────────────────────────────────────
 window.addEventListener("DOMContentLoaded", async () => {
-  await loadTeam();
   const saved = localStorage.getItem("icb_me");
+
   if (saved) {
-    const sv   = JSON.parse(saved);
-    const fresh = TEAM.find(u => u.id === sv.id && u.phone === sv.phone);
-    if (fresh) { ME = fresh; bootApp(); return; }
+    // Try to restore session — retry Firebase load up to 3 times before giving up
+    const sv = JSON.parse(saved);
+    let fresh = null;
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 3 && !fresh; attempt++) {
+      try {
+        await loadTeam();
+        fresh = TEAM.find(u => u.id === sv.id && u.phone === sv.phone);
+        if (!fresh && attempt < 2) {
+          // small delay before retry — helps on slow mobile networks
+          await new Promise(r => setTimeout(r, 700));
+        }
+      } catch(e) {
+        lastError = e;
+        await new Promise(r => setTimeout(r, 700));
+      }
+    }
+
+    if (fresh) {
+      ME = fresh;
+      bootApp();
+      return;
+    }
+
+    // Could not confirm user after retries — but DON'T silently wipe session
+    // if it looks like a network issue (TEAM is empty/failed to load)
+    if (TEAM.length === 0) {
+      // Network/Firebase problem — keep session, show login with a warning so user can retry
+      showLogin();
+      const err = document.getElementById("login-err");
+      err.innerHTML = '<i class="ti ti-wifi-off"></i> Could not connect to server. Check your internet and try signing in again.';
+      err.style.display = "flex";
+      // Pre-fill their phone number so they just need to type password again
+      document.getElementById("lphone").value = sv.phone || "";
+      return;
+    }
+
+    // TEAM loaded fine but this specific user really doesn't exist anymore (deleted)
     localStorage.removeItem("icb_me");
+    showLogin();
+    return;
   }
+
+  // No saved session — just load team in background for faster first login
+  await loadTeam();
   showLogin();
 });
 
@@ -1426,6 +1498,46 @@ function toast(title,msg,type=""){
   d.innerHTML=`<i class="ti ${icon}"></i><div><div class="toast-t">${title}</div>${msg?`<div class="toast-m">${msg}</div>`:""}</div>`;
   document.getElementById("toastzone").appendChild(d);
   setTimeout(()=>d.remove(),5500);
+}
+
+// ── PWA INSTALL SUPPORT ──────────────────────────────────────
+// Registers a minimal inline service worker (built as a Blob) so Chrome/Android
+// treats this page as a real installable app, not just a bookmark.
+if ("serviceWorker" in navigator) {
+  const swCode = `
+    self.addEventListener('install', e => self.skipWaiting());
+    self.addEventListener('activate', e => self.clients.claim());
+    self.addEventListener('fetch', e => {
+      // Pass-through network fetch — keeps the app working online,
+      // satisfies PWA installability requirements
+      e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+    });
+  `;
+  const swBlob = new Blob([swCode], { type: "application/javascript" });
+  const swUrl  = URL.createObjectURL(swBlob);
+  navigator.serviceWorker.register(swUrl).catch(e => console.warn("SW registration skipped:", e));
+}
+
+// Capture the native "Add to Home Screen" prompt so we can show our own button
+let deferredInstallPrompt = null;
+window.addEventListener("beforeinstallprompt", e => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  const installBtn = document.getElementById("install-app-btn");
+  if (installBtn) installBtn.style.display = "flex";
+});
+function installApp() {
+  if (!deferredInstallPrompt) {
+    toast("Already installed or not supported", "Use your browser menu → Add to Home Screen", "");
+    return;
+  }
+  deferredInstallPrompt.prompt();
+  deferredInstallPrompt.userChoice.then(choice => {
+    if (choice.outcome === "accepted") toast("App installed!", "ICB Plant added to your home screen", "success");
+    deferredInstallPrompt = null;
+    const installBtn = document.getElementById("install-app-btn");
+    if (installBtn) installBtn.style.display = "none";
+  });
 }
 </script>
 </body>
