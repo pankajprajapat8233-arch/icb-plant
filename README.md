@@ -756,45 +756,61 @@ async function doLogin() {
     err.style.display = "flex"; return;
   }
 
-  btn.innerHTML  = '<span class="spin" style="width:18px;height:18px;border-width:2px;margin-top:0"></span> Checking...';
-  btn.disabled   = true;
+  btn.innerHTML = '<span class="spin" style="width:18px;height:18px;border-width:2px;margin-top:0"></span> Checking...';
+  btn.disabled  = true;
 
-  // ALWAYS fetch fresh team from Firebase before checking login
   try {
+    // Fetch ALL team data fresh from Firebase
     const snap = await DB.ref("team").once("value");
-    if (snap.exists()) {
-      TEAM = [];
-      snap.forEach(child => TEAM.push({ id: child.key, ...child.val() }));
-      // re-seed missing members if team is incomplete
-      if (TEAM.length < DEFAULT_TEAM.length) {
-        for (const m of DEFAULT_TEAM) {
-          if (!TEAM.find(u => u.id === m.id)) {
-            await DB.ref("team/" + m.id).set(m);
-            TEAM.push({...m});
-          }
-        }
-      }
-    } else {
-      await seedTeam();
+
+    if (!snap.exists()) {
+      // No team data at all - tell user to click setup button
+      err.innerHTML = '<i class="ti ti-alert-circle"></i> No team data found. Please click the Setup button below first.';
+      err.style.display = "flex";
+      btn.innerHTML = '<i class="ti ti-login"></i> Sign In';
+      btn.disabled  = false;
+      return;
     }
+
+    // Load all team members from Firebase into TEAM array
+    TEAM = [];
+    snap.forEach(child => {
+      const member = child.val();
+      // Handle both field names: pw and password
+      if (!member.pw && member.password) member.pw = member.password;
+      TEAM.push(member);
+    });
+
+    // Try to find user - check phone AND password
+    const user = TEAM.find(u => {
+      const phoneMatch = String(u.phone).trim() === String(phone).trim();
+      const pwMatch    = String(u.pw || u.password || "").trim() === String(pw).trim();
+      return phoneMatch && pwMatch;
+    });
+
+    btn.innerHTML = '<i class="ti ti-login"></i> Sign In';
+    btn.disabled  = false;
+
+    if (!user) {
+      // Show what phones ARE registered to help debug
+      const phones = TEAM.map(u => u.phone).join(", ");
+      err.innerHTML = `<i class="ti ti-alert-circle"></i> Wrong mobile or password.<br>
+        <small style="opacity:0.8">Registered mobiles: ${phones}</small>`;
+      err.style.display = "flex";
+      return;
+    }
+
+    ME = user;
+    localStorage.setItem("icb_me", JSON.stringify({id: user.id, phone: user.phone}));
+    bootApp();
+
   } catch(e) {
-    console.warn("Could not fetch team:", e);
+    console.error("Login error:", e);
+    err.innerHTML = '<i class="ti ti-alert-circle"></i> Connection error: ' + e.message;
+    err.style.display = "flex";
+    btn.innerHTML = '<i class="ti ti-login"></i> Sign In';
+    btn.disabled  = false;
   }
-
-  // Check credentials against fresh data
-  const user = TEAM.find(u => u.phone === phone && u.pw === pw);
-
-  btn.innerHTML = '<i class="ti ti-login"></i> Sign In';
-  btn.disabled  = false;
-
-  if (!user) {
-    err.innerHTML = '<i class="ti ti-alert-circle"></i> Wrong mobile number or password. Contact HOD to check your credentials.';
-    err.style.display = "flex"; return;
-  }
-
-  ME = user;
-  localStorage.setItem("icb_me", JSON.stringify({id: user.id, phone: user.phone}));
-  bootApp();
 }
 
 function doLogout() {
